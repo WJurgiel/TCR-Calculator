@@ -5,6 +5,7 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import csv
 import os
+from controllers import ForcesManager
 
 
 class ForcesTab(ttk.Frame):
@@ -12,8 +13,11 @@ class ForcesTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
 
-        # Internal storage: list of forces in Newtons
-        self.forces = []
+        # Manager for business logic
+        self.manager = ForcesManager(app=self.app)
+        self.manager.subscribe(self._on_manager_event)
+
+        # View state
         self.force_widgets = {}  # idx -> entry widget for force value
 
         # Header / controls
@@ -38,18 +42,14 @@ class ForcesTab(ttk.Frame):
 
     def _add_force_row(self):
         """Add a new empty force row."""
-        self.forces.append({'value': ''})
-        self.app.log('✓ Dodano nową siłę do listy')
+        success, msg = self.manager.add_force()
+        self.app.log(('✓ ' if success else '! ') + msg)
         self._rebuild_forces_list()
 
     def _clear_all_forces(self):
         """Clear all forces."""
-        if not self.forces:
-            self.app.log('! Lista sił jest pusta')
-            return
-        count = len(self.forces)
-        self.forces.clear()
-        self.app.log(f'✓ Wyczyściłem listę sił ({count} pozycji)')
+        success, msg = self.manager.clear_forces()
+        self.app.log(('✓ ' if success else '! ') + msg)
         self._rebuild_forces_list()
 
     def _import_forces_file(self):
@@ -59,27 +59,16 @@ class ForcesTab(ttk.Frame):
             return
 
         try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith('#')]
+            success, msg, imported = self.manager.import_forces_file(file_path)
         except Exception as e:
             self.app.log(f'! Błąd przy czytaniu pliku sił: {e}')
             return
 
-        imported_count = 0
-        for line in lines:
-            try:
-                force_val = float(line)
-                self.forces.append({'value': force_val})
-                imported_count += 1
-            except ValueError:
-                self.app.log(f'! Import sił: nieprawidłowa wartość "{line}" — pomijam')
-                continue
-
-        if imported_count > 0:
-            self.app.log(f'✓ Importowano {imported_count} sił z pliku')
+        if success:
+            self.app.log('✓ ' + msg)
             self._rebuild_forces_list()
         else:
-            self.app.log('! Nie udało się importować sił z pliku (brak prawidłowych wpisów)')
+            self.app.log('! ' + msg)
 
     def _rebuild_forces_list(self):
         """Rebuild the forces list UI."""
@@ -87,7 +76,7 @@ class ForcesTab(ttk.Frame):
         for widget in self.container.winfo_children():
             widget.destroy()
 
-        if not self.forces:
+        if not self.manager.get_forces():
             lbl = ttk.Label(self.container, text='(brak zdefiniowanych sił)')
             lbl.pack(padx=10, pady=10)
             return
@@ -109,7 +98,7 @@ class ForcesTab(ttk.Frame):
 
         # Force rows
         self.force_widgets = {}
-        for idx, force_data in enumerate(self.forces, start=1):
+        for idx, force_data in enumerate(self.manager.get_forces(), start=1):
             ent = ttk.Entry(inner, width=15)
             ent.grid(row=idx, column=0, padx=4, pady=2, sticky='w')
             ent.delete(0, 'end')
@@ -131,19 +120,15 @@ class ForcesTab(ttk.Frame):
 
     def _save_forces(self):
         """Save forces from widgets back to self.forces."""
-        for idx, ent in self.force_widgets.items():
-            if idx < len(self.forces):
-                try:
-                    val_str = ent.get().strip()
-                    if val_str == '':
-                        self.forces[idx]['value'] = ''
-                    else:
-                        self.forces[idx]['value'] = float(val_str)
-                except ValueError:
-                    self.app.log(f'! Siła o indeksie {idx} ma nieprawidłową wartość: "{val_str}"')
-                    self.forces[idx]['value'] = ''
-
-        self.app.system_forces = self.forces.copy()
+        values = []
+        for idx in sorted(self.force_widgets.keys()):
+            ent = self.force_widgets[idx]
+            try:
+                values.append(ent.get().strip())
+            except Exception:
+                values.append('')
+        self.manager.update_force_values(values)
+        self.app.system_forces = self.manager.get_forces().copy()
         self.app.log('✓ Zapisano siły do systemu')
 
     def _generate_report(self):
@@ -152,48 +137,19 @@ class ForcesTab(ttk.Frame):
         self._save_forces()
 
         # Check if there are forces
-        if not self.forces:
-            messagebox.showwarning('Brak sił', 'Zdefiniuj przynajmniej jedną siłę do generowania raportu')
-            return
-
-        # Get TCR interfaces
         interfaces = getattr(self.app, 'system_interfaces', []) or []
-        tcr_interfaces = [it for it in interfaces if getattr(it, 'has_tcr', False)]
+        self.manager.set_system(interfaces)
 
-        if not tcr_interfaces:
-            messagebox.showwarning('Brak interfejsów TCR', 'Nie ma żadnych interfejsów ze zdefiniowanym TCR')
+        ok, msg, report_data = self.manager.generate_report()
+        if not ok:
+            if 'siłę' in msg:
+                messagebox.showwarning('Brak sił', msg)
+            elif 'interfejsów' in msg:
+                messagebox.showwarning('Brak interfejsów TCR', msg)
+            else:
+                messagebox.showerror('Błąd', msg)
             return
 
-        # Build report data: for each force case and each interface, calculate pressure
-        report_data = []
-        for force_idx, force_data in enumerate(self.forces):
-            try:
-                force_val = float(force_data.get('value', 0))
-            except (ValueError, TypeError):
-                continue
-
-            for iface in tcr_interfaces:
-                try:
-                    a_nominal = iface.A_nominal  # m^2
-                    pressure = force_val / a_nominal if a_nominal > 0 else 0  # Pa
-                    iface_name = f"{iface.geom_top.name} → {iface.geom_bottom.name}"
-                    
-                    report_data.append({
-                        'force_idx': force_idx,
-                        'force_value': force_val,
-                        'interface': iface_name,
-                        'area': a_nominal,
-                        'pressure': pressure
-                    })
-                except Exception as e:
-                    self.app.log(f'! Błąd przy liczeniu ciśnienia dla interfejsu: {e}')
-                    continue
-
-        if not report_data:
-            messagebox.showerror('Błąd', 'Nie udało się wygenerować raportu')
-            return
-
-        # Open report window
         self._show_report_window(report_data)
 
     def _show_report_window(self, report_data):
@@ -268,23 +224,15 @@ class ForcesTab(ttk.Frame):
         if not file_path:
             return
 
-        try:
-            with open(file_path, 'w', newline='', encoding='utf-8') as f:
-                writer = csv.writer(f)
-                # Header
-                writer.writerow(['Siła [N]', 'Interfejs', 'Pow. Nom. [m²]', 'Ciśnienie [Pa]', 'Ciśnienie [MPa]'])
-                # Data rows
-                for row_data in report_data:
-                    force_val = row_data['force_value']
-                    iface_name = row_data['interface']
-                    area = row_data['area']
-                    pressure_pa = row_data['pressure']
-                    pressure_mpa = pressure_pa / 1e6
-                    writer.writerow([f"{force_val:.2f}", iface_name, f"{area:.6e}", 
-                                   f"{pressure_pa:.2e}", f"{pressure_mpa:.4f}"])
-            
+        success, msg = self.manager.export_report_csv(file_path, report_data)
+        if success:
             self.app.log(f'✓ Eksportowano raport do pliku: {os.path.basename(file_path)}')
-            messagebox.showinfo('Sukces', f'Raport został wyeksportowany do:\n{file_path}')
-        except Exception as e:
-            messagebox.showerror('Błąd', f'Nie udało się wyeksportować raportu: {e}')
-            self.app.log(f'! Błąd przy eksporcie: {e}')
+            messagebox.showinfo('Sukces', msg)
+        else:
+            messagebox.showerror('Błąd', msg)
+            self.app.log('! ' + msg)
+
+    # --- Manager events ---
+    def _on_manager_event(self, event_type, data):
+        # UI redraws are driven by explicit calls
+        pass
