@@ -7,16 +7,19 @@ from tkinter import Canvas
 import os
 from models import Geometry, Interface
 from dialogs import GeometryDialog
+from controllers.system_controller import SystemManager
 
 
 class SystemTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
-        
-        # System state
-        self.geometries = []  # List of Geometry objects
-        self.interfaces = []  # List of Interface objects
+
+        # Controller (business logic)
+        self.manager = SystemManager(app=self.app)
+        self.manager.subscribe(self._on_manager_event)
+
+        # View state
         self.system_saved = False
         
         # Main layout
@@ -67,72 +70,31 @@ class SystemTab(ttk.Frame):
         self.wait_window(dialog)
         
         if dialog.result:
-            # Check for name uniqueness
-            new_name = dialog.result.name
-            existing_names = [g.name for g in self.geometries]
-            if new_name in existing_names:
-                messagebox.showwarning('Warning', f'Bryła "{new_name}" już istnieje. Zmień nazwę.')
-                self.app.log(f'! Próba dodania bryły z istniejącą nazwą: {new_name} — odrzucono')
-                return
-            
-            if index is None:
-                self.geometries.append(dialog.result)
+            success, msg = self.manager.add_geometry(dialog.result, index)
+            if success:
+                self.app.log(f'✓ {msg}')
+                self._redraw_canvas()
             else:
-                self.geometries.insert(index, dialog.result)
-            
-            # Rebuild interfaces
-            self._rebuild_interfaces()
-            self._redraw_canvas()
-
-            # Log to console
-            geom = dialog.result
-            self.app.log(f'✓ Dodano Geometrię: {geom.name} (a={geom.length}, b={geom.width}, h={geom.height})')
+                messagebox.showwarning('Warning', msg)
+                self.app.log(f'! {msg} — odrzucono')
     
     def _add_geometry_at(self, index):
         """Add geometry at specific position (for 'above' button)."""
         self._add_geometry(index)
     
     def _rebuild_interfaces(self):
-        """Rebuild interface list based on current geometries."""
-        old_interfaces = {(g.geom_top.name, g.geom_bottom.name): g.has_tcr
-                          for g in self.interfaces if isinstance(g, Interface)}
-
-        # Determine current geometry names for removed-geometry detection
-        current_names = {g.name for g in self.geometries}
-
-        # Build new interfaces, preserving TCR flags where possible
-        new_keys = []
-        new_interfaces = []
-        for i in range(len(self.geometries) - 1):
-            geom_top = self.geometries[i]
-            geom_bottom = self.geometries[i + 1]
-            key = (geom_top.name, geom_bottom.name)
-            new_keys.append(key)
-            has_tcr = old_interfaces.get(key, False)
-            new_interfaces.append(Interface(geom_top, geom_bottom, has_tcr))
-
-        # Log any TCRs that existed previously but are no longer present
-        removed_tcrs = [k for k, v in old_interfaces.items() if v and k not in new_keys]
-        for top_name, bot_name in removed_tcrs:
-            # try to detect which geometry was removed
-            removed_geom = None
-            if top_name not in current_names:
-                removed_geom = top_name
-            elif bot_name not in current_names:
-                removed_geom = bot_name
-
-            if removed_geom:
-                self.app.log(f'✗ Usunięto TCR: {top_name}→{bot_name} na skutek usunięcia bryły: {removed_geom}')
-            else:
-                self.app.log(f'✗ Usunięto TCR: {top_name}→{bot_name}')
-
-        self.interfaces = new_interfaces
+        """Wrapper delegating to manager."""
+        success, _ = self.manager.rebuild_interfaces()
+        if success:
+            # Logging of removed TCRs handled in event callback
+            pass
     
     def _redraw_canvas(self):
         """Redraw the visualization of geometries and interfaces."""
         self.canvas.delete('all')
         
-        if not self.geometries:
+        geoms = self.manager.get_geometries()
+        if not geoms:
             # Calculate canvas dimensions for centering
             canvas_width = self.canvas.winfo_width()
             canvas_height = self.canvas.winfo_height()
@@ -151,8 +113,8 @@ class SystemTab(ttk.Frame):
             return
         
         # Calculate total height and max width
-        total_height = sum(g.height for g in self.geometries)
-        max_width = max(g.width for g in self.geometries)
+        total_height = sum(g.height for g in geoms)
+        max_width = max(g.width for g in geoms)
         
         # Canvas dimensions
         canvas_width = self.canvas.winfo_width()
@@ -171,9 +133,9 @@ class SystemTab(ttk.Frame):
         y_pos = margin
         self.geometry_rects = []  # Store rect info for click handling
         
-        for i, geom in enumerate(self.geometries):
+        for i, geom in enumerate(geoms):
             # Scale height
-            scaled_height = (geom.height / total_height) * draw_height if total_height > 0 else draw_height / len(self.geometries)
+            scaled_height = (geom.height / total_height) * draw_height if total_height > 0 else draw_height / len(geoms)
             # Scale width
             scaled_width = (geom.width / max_width) * draw_width if max_width > 0 else draw_width
             
@@ -204,7 +166,7 @@ class SystemTab(ttk.Frame):
         for w in self.tcr_frame.winfo_children():
             w.destroy()
         
-        for i, interface in enumerate(self.interfaces):
+        for i, interface in enumerate(self.manager.get_interfaces()):
             var = tk.BooleanVar(value=interface.has_tcr)
             cb = ttk.Checkbutton(
                 self.tcr_frame,
@@ -213,19 +175,17 @@ class SystemTab(ttk.Frame):
                 command=lambda idx=i, v=var: self._on_tcr_change(idx, v)
             )
             cb.pack(anchor='w', padx=5, pady=2)
-            self.interfaces[i]._tcr_var = var  # Store reference
+            # Store reference on interface object for UI convenience
+            self.manager.interfaces[i]._tcr_var = var
     
     def _on_tcr_change(self, interface_idx, var):
         """Update TCR flag when checkbox is toggled."""
-        if 0 <= interface_idx < len(self.interfaces):
+        if 0 <= interface_idx < len(self.manager.interfaces):
             new_val = var.get()
-            self.interfaces[interface_idx].has_tcr = new_val
-            top = self.interfaces[interface_idx].geom_top.name
-            bot = self.interfaces[interface_idx].geom_bottom.name
-            if new_val:
-                self.app.log(f'✓ Dodano TCR: {top}→{bot}')
-            else:
-                self.app.log(f'✗ Usunięto TCR: {top}→{bot}')
+            success, msg = self.manager.set_tcr_flag(interface_idx, new_val)
+            if success:
+                symbol = '✓' if new_val else '✗'
+                self.app.log(f'{symbol} {msg}')
     
     def _on_canvas_click(self, event):
         """Handle click on geometry rectangle to edit it."""
@@ -239,14 +199,15 @@ class SystemTab(ttk.Frame):
     
     def _edit_geometry(self, index):
         """Edit an existing geometry."""
-        geom = self.geometries[index]
+        geoms = self.manager.get_geometries()
+        geom = geoms[index]
         
         def on_delete():
             """Callback when delete is requested."""
-            self.geometries.pop(index)
-            self.app.log(f'✗ Usunięto Geometrię: {geom.name}')
-            self._rebuild_interfaces()
-            self._redraw_canvas()
+            success, msg = self.manager.remove_geometry(index)
+            if success:
+                self.app.log(f'✗ {msg}')
+                self._redraw_canvas()
         
         dialog = GeometryDialog(self, geometry=geom, on_delete=on_delete)
         self.wait_window(dialog)
@@ -256,20 +217,13 @@ class SystemTab(ttk.Frame):
             return
         
         if dialog.result:
-            # Check if name changed and if new name already exists in another geometry
-            new_name = dialog.result.name
-            old_name = geom.name
-            if new_name != old_name:
-                other_names = [g.name for i, g in enumerate(self.geometries) if i != index]
-                if new_name in other_names:
-                    messagebox.showwarning('Warning', f'Bryła "{new_name}" już istnieje. Zmień nazwę.')
-                    self.app.log(f'! Próba zmiany nazwy na istniejącą: {new_name} — odrzucono')
-                    return
-            
-            self.geometries[index] = dialog.result
-            self.app.log(f'✓ Edytowano Geometrię: {dialog.result.name} (a={dialog.result.length}, b={dialog.result.width}, h={dialog.result.height})')
-            self._rebuild_interfaces()
-            self._redraw_canvas()
+            success, msg = self.manager.update_geometry(index, dialog.result)
+            if success:
+                self.app.log(f'✓ {msg}')
+                self._redraw_canvas()
+            else:
+                messagebox.showwarning('Warning', msg)
+                self.app.log(f'! {msg} — odrzucono')
     
     def _import_file(self):
         """Import geometry from file."""
@@ -281,51 +235,18 @@ class SystemTab(ttk.Frame):
         if not file_path:
             return
         
-        try:
-            with open(file_path, 'r') as f:
-                lines = [line.strip() for line in f if line.strip()]
-            
-            geometries = []
-            
-            for i, line in enumerate(lines):
-                # Parse geometry line
-                parts = line.split()
-                if len(parts) < 4:
-                    messagebox.showerror('Error', f'Invalid format at line {i+1}')
-                    return
-                
-                try:
-                    name = parts[0]
-                    length = float(parts[1])
-                    width = float(parts[2])
-                    height = float(parts[3])
-                    geometries.append(Geometry(name, length, width, height))
-                except ValueError:
-                    messagebox.showerror('Error', f'Invalid numbers at line {i+1}')
-                    return
-            
-            # Check for duplicate names
-            names = [g.name for g in geometries]
-            if len(names) != len(set(names)):
-                duplicates = [n for n in set(names) if names.count(n) > 1]
-                messagebox.showerror('Error', f'Nieprawidłowe dane: dwie bryły o takich samych nazwach: {", ".join(duplicates)}')
-                self.app.log(f'! Import przerwany: duplikaty nazw brył — {", ".join(duplicates)}')
-                return
-            
-            self.geometries = geometries
-            self._rebuild_interfaces()
+        success, msg = self.manager.import_from_file(file_path)
+        if success:
+            # Count taken from message, ensure UI refresh
             self._redraw_canvas()
-            messagebox.showinfo('Success', f'Imported {len(geometries)} geometries')
-            self.app.log(f'✓ Zaimportowano {len(geometries)} geometrii z pliku')
-        
-        except Exception as e:
-            messagebox.showerror('Error', f'Failed to import: {str(e)}')
+            messagebox.showinfo('Success', msg)
+            self.app.log(f'✓ Zaimportowano geometrię z pliku — {msg}')
+        else:
+            messagebox.showerror('Error', msg)
     
     def _export_system(self):
         """Export geometry system to file."""
-        if not self.geometries:
-            messagebox.showwarning('Warning', 'No geometries to export')
-            return
+        # Manager will validate export preconditions
         
         file_path = filedialog.asksaveasfilename(
             filetypes=[('Text files', '*.txt')],
@@ -336,40 +257,35 @@ class SystemTab(ttk.Frame):
         if not file_path:
             return
         
-        try:
-            with open(file_path, 'w') as f:
-                for geom in self.geometries:
-                    f.write(f'{geom.name}\t{geom.length}\t{geom.width}\t{geom.height}\n')
-            
-            messagebox.showinfo('Success', f'Exported to {os.path.basename(file_path)}')
+        success, msg = self.manager.export_to_file(file_path)
+        if success:
+            messagebox.showinfo('Success', msg)
             self.app.log(f'✓ Wyeksportowano system do pliku: {os.path.basename(file_path)}')
-        
-        except Exception as e:
-            messagebox.showerror('Error', f'Failed to export: {str(e)}')
+        else:
+            messagebox.showerror('Error', msg)
     
     def _save_system(self):
         """Save and validate the system before moving to next tab."""
-        if not self.geometries:
-            messagebox.showwarning('Warning', 'Define at least one geometry')
-            return
-        
-        invalid = [g for g in self.geometries if not g.is_valid()]
-        if invalid:
-            names = ', '.join(g.name for g in invalid)
-            messagebox.showerror('Error', f'Invalid geometries: {names}')
+        ok, validation_msg = self.manager.validate_system()
+        if not ok:
+            # Map manager messages to original UI wording
+            if validation_msg.startswith('Zdefiniuj'):
+                messagebox.showwarning('Warning', 'Define at least one geometry')
+            else:
+                messagebox.showerror('Error', validation_msg.replace('Nieprawidłowe', 'Invalid'))
             return
         
         # Store system in parent app
         if hasattr(self.app, 'system_geometries'):
-            self.app.system_geometries = self.geometries
-            self.app.system_interfaces = self.interfaces
+            self.app.system_geometries = self.manager.get_geometries()
+            self.app.system_interfaces = self.manager.get_interfaces()
             
             # Create simple system object for easier access
             class System:
                 pass
             sys = System()
-            sys.geometries = self.geometries
-            sys.interfaces = self.interfaces
+            sys.geometries = self.manager.get_geometries()
+            sys.interfaces = self.manager.get_interfaces()
             self.app.system = sys
 
         self.system_saved = True
@@ -389,3 +305,23 @@ class SystemTab(ttk.Frame):
             self.app.log(f'! Błąd podczas odświeżania zakładki Materiały: {e}')
 
         messagebox.showinfo('Success', 'System saved successfully')
+
+    # --- Manager events -> View updates ---
+    def _on_manager_event(self, event_type, data):
+        if event_type in ('geometry_added', 'geometry_removed', 'geometry_updated', 'interfaces_rebuilt', 'imported'):
+            # Handle removed TCR logs
+            if event_type == 'interfaces_rebuilt':
+                removed_tcrs = data.get('removed_tcrs', [])
+                current_names = {g.name for g in self.manager.get_geometries()}
+                for top_name, bot_name in removed_tcrs:
+                    removed_geom = None
+                    if top_name not in current_names:
+                        removed_geom = top_name
+                    elif bot_name not in current_names:
+                        removed_geom = bot_name
+                    if removed_geom:
+                        self.app.log(f'✗ Usunięto TCR: {top_name}→{bot_name} na skutek usunięcia bryły: {removed_geom}')
+                    else:
+                        self.app.log(f'✗ Usunięto TCR: {top_name}→{bot_name}')
+            # Redraw UI consistently
+            self._redraw_canvas()
