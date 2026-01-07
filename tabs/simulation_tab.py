@@ -7,14 +7,18 @@ import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import csv
 import os
-import math
+from controllers import SimulationManager
 
 class SimulationTab(ttk.Frame):
     def __init__(self, parent, app):
         super().__init__(parent)
         self.app = app
 
-        # Storage: interface_idx -> {'tim_name': str, 'layer_thickness': float, ...}
+        # Manager for business logic
+        self.manager = SimulationManager(app=self.app)
+        self.manager.subscribe(self._on_manager_event)
+
+        # UI state
         self.interface_config = {}
 
         self._setup_ui()
@@ -173,101 +177,24 @@ class SimulationTab(ttk.Frame):
         Extracts and calculates effective parameters for a single interface.
         Returns a dictionary with SI units.
         """
-        name_top = iface.geom_top.name
-        name_bottom = iface.geom_bottom.name
-        
-        mat_top = materials.get(name_top, {})
-        mat_bottom = materials.get(name_bottom, {})
-
-        try:
-            # Helper to safely get float
-            def get_val(d, k, scale=1.0): 
-                return float(d.get(k, 0)) * scale
-
-            # 1. Roughness (sigma) [µm -> m]
-            sig_1 = get_val(mat_top, 'sigma', 1e-6)
-            sig_2 = get_val(mat_bottom, 'sigma', 1e-6)
-            sig_s = math.sqrt(sig_1**2 + sig_2**2)
-
-            # 2. Slope (m) [absolute]
-            m_1 = get_val(mat_top, 'm')
-            m_2 = get_val(mat_bottom, 'm')
-            m_s = math.sqrt(m_1**2 + m_2**2)
-
-            # 3. Thermal Conductivity (k) [W/mK]
-            k_1 = get_val(mat_top, 'k')
-            k_2 = get_val(mat_bottom, 'k')
-            # Harmonic mean for contact
-            k_s = (2 * k_1 * k_2) / (k_1 + k_2) if (k_1 + k_2) > 0 else 0
-
-            # 4. Young's Modulus (E) [GPa -> Pa] & Poisson
-            e_1 = get_val(mat_top, 'young', 1e9)
-            e_2 = get_val(mat_bottom, 'young', 1e9)
-            v_1 = get_val(mat_top, 'poisson')
-            v_2 = get_val(mat_bottom, 'poisson')
-            
-            denom = e_2 * (1 - v_1**2) + e_1 * (1 - v_2**2)
-            e_s = (e_1 * e_2) / denom if denom > 0 else 0
-
-            # 5. Microhardness (Hc) [MPa -> Pa]
-            # Use the softer material
-            hc_1 = get_val(mat_top, 'hc', 1e6)
-            hc_2 = get_val(mat_bottom, 'hc', 1e6)
-            # Filter out zeros if any material data is missing
-            valid_hcs = [h for h in (hc_1, hc_2) if h > 0]
-            hc_soft = min(valid_hcs) if valid_hcs else 0
-
-            return {
-                'name': f"{name_top} → {name_bottom}",
-                'sig_s': sig_s,
-                'm_s': m_s,
-                'k_s': k_s,
-                'e_s': e_s,
-                'hc_soft': hc_soft,
-                'A_nom': getattr(iface, 'A_nominal', 0) or 0
-            }
-        except Exception as e:
-            print(f"Error extracting params: {e}")
-            return None
+        # Delegated to manager for business logic
+        return self.manager.get_interface_params(iface)
 
     # =========================================================================
     #  MODELS (Callback strategies)
     # =========================================================================
 
     def _calc_hc_mikic_elastic(self, params, P):
-        k_s, m_s, sig_s, e_s = params['k_s'], params['m_s'], params['sig_s'], params['e_s']
-        
-        if sig_s > 0 and m_s > 0 and e_s > 0:
-            inner = (math.sqrt(2) * P) / (m_s * e_s)
-            if inner > 0:
-                return 1.54 * k_s * (m_s / sig_s) * (inner ** 0.94)
-        return 0.0
+        return self.manager.calc_mikic_elastic(params, P)
 
     def _calc_hc_mikic_plastic(self, params, P):
-        k_s, m_s, sig_s, hc = params['k_s'], params['m_s'], params['sig_s'], params['hc_soft']
-        
-        if sig_s > 0 and m_s > 0 and hc > 0:
-            rel_p = P / hc
-            if rel_p > 0:
-                return 1.13 * k_s * (m_s / sig_s) * (rel_p ** 0.94)
-        return 0.0
+        return self.manager.calc_mikic_plastic(params, P)
 
     def _calc_hc_cmy(self, params, P):
-        k_s, m_s, sig_s, hc = params['k_s'], params['m_s'], params['sig_s'], params['hc_soft']
-
-        if sig_s > 0 and m_s > 0 and hc > 0:
-            rel_p = P / hc
-            if rel_p > 0:
-                return 1.45 * k_s * (m_s / sig_s) * (rel_p ** 0.985)
-        return 0.0
+        return self.manager.calc_cmy(params, P)
 
     def _calc_hc_yovanovich(self, params, P):
-        k_s, m_s, sig_s, hc = params['k_s'], params['m_s'], params['sig_s'], params['hc_soft']
-
-        if sig_s > 0 and m_s > 0 and hc > 0:
-            rel_p = P / hc
-            if rel_p > 0:
-                return 1.25 * k_s * (m_s / sig_s) * (rel_p ** 0.95)
+        return self.manager.calc_yovanovich(params, P)
 
     # =========================================================================
     #  GENERIC SIMULATION RUNNER
@@ -285,7 +212,7 @@ class SimulationTab(ttk.Frame):
         if not self.interface_config:
             messagebox.showwarning('Błąd', 'Brak skonfigurowanych interfejsów.')
             return
-        
+
         try:
             thot = float(self.ent_thot.get().replace(',', '.'))
             tcold = float(self.ent_tcold.get().replace(',', '.'))
@@ -298,120 +225,27 @@ class SimulationTab(ttk.Frame):
             messagebox.showwarning('Błąd', 'Brak zdefiniowanych sił w systemie.')
             return
 
-        # 2. Preparation
+        # Set context on manager
         materials = getattr(self.app, 'system_materials', {}) or {}
         tims_list = getattr(self.app, 'system_tims', []) or []
-        
-        results_tcr = []
-        iface_tcr_accumulation = {} # For system Q calculation
-        
-        # 3. Loop through Interfaces
-        # We iterate over stored config which maps iface_idx -> user selection
-        for iface_idx, cfg in self.interface_config.items():
-            iface = cfg['interface']
-            
-            # Get processed params (SI units)
-            params = self._get_interface_params(iface, materials)
-            if not params:
-                continue
+        geoms = getattr(self.app, 'system_geometries', []) or []
+        interfaces = getattr(self.app, 'system_interfaces', []) or []
+        self.manager.set_context(geoms, interfaces, materials, tims_list, forces)
 
-            # Get TIM Info
-            tim_name = cfg['tim_var'].get()
-            selected_tim = next((t for t in tims_list if t['name'] == tim_name), None)
-            
-            # --- Logic for Thickness / BLT ---
-            user_blt_str = cfg['thickness_entry'].get().replace(',', '.')
-            
-            is_gas = (selected_tim.get('type') == 'gas') if selected_tim else False
-            is_press_dep = selected_tim.get('pressure_dependent', False) if selected_tim else False
-            
-            # 4. Loop through Forces
-            for force_val in forces:
-                A_nom = params['A_nom']
-                if A_nom <= 0: continue
+        ok, msg, results_tcr, results_q = self.manager.run_model(model_name, calculation_func, self.interface_config, thot, tcold)
+        if not ok:
+            if 'sił' in msg:
+                messagebox.showwarning('Błąd', msg)
+            else:
+                messagebox.showerror('Błąd', msg)
+            return
 
-                Pressure = force_val / A_nom
-
-                # --- A. Contact Conductance (Model Specific) ---
-                h_c = calculation_func(params, Pressure)
-
-                # --- B. Gap Conductance (TIM) ---
-                h_int = 0.0
-                
-                if selected_tim:
-                    k_tim = float(selected_tim.get('k', 0))
-                    
-                    if is_gas and is_press_dep:
-                        # Auto-calculate using Antonetti formula
-                        hc_soft = params['hc_soft']
-                        sig_s = params['sig_s']
-                        
-                        if hc_soft > 0 and sig_s > 0 and Pressure > 0:
-                            try:
-                                delta = 1.53 * sig_s * ((Pressure / hc_soft) ** -0.097)
-                                if delta > 0:
-                                    h_int = k_tim / delta
-                            except Exception:
-                                h_int = 0.0
-                    else:
-                        # Use Fixed thickness (user input)
-                        try:
-                            blt_val = float(user_blt_str)
-                            if blt_val > 0:
-                                h_int = k_tim / blt_val
-                        except ValueError:
-                            h_int = 0.0
-
-                
-                # --- C. Effective Resistance & Metrics ---
-                h_eff = h_c + h_int
-                
-                # Metrics for table
-                R_c = 1.0 / (h_c * A_nom) if h_c > 0 else float('inf')
-                R_int = 1.0 / (h_int * A_nom) if h_int > 0 else float('inf')
-                
-                pct_styku = 0.0
-                if params['hc_soft'] > 0:
-                    pct_styku = min(100.0, (Pressure / params['hc_soft']) * 100.0)
-                pct_int = 100.0 - pct_styku
-
-                if h_eff > 0:
-                    R_eff = 1.0 / (h_eff * A_nom)
-                    TCR = R_eff
-                    K_eff = 0.0001 / (TCR * A_nom)
-                else:
-                    R_eff = float('inf')
-                    TCR = float('inf')
-                    K_eff = 0.0
-
-                # Store result row
-                results_tcr.append({
-                    'force_N': force_val,
-                    'interface': params['name'],
-                    'pressure_Pa': Pressure,
-                    'pct_styku': pct_styku,
-                    'pct_int': pct_int,
-                    'h_c': h_c,
-                    'R_c': R_c,
-                    'h_int': h_int,
-                    'R_int': R_int,
-                    'h_eff': h_eff,
-                    'TCR': TCR,
-                    'K': K_eff
-                })
-
-                # Accumulate for Q calculation
-                key = params['name']
-                iface_tcr_accumulation.setdefault(key, []).append({
-                    'force': force_val, 
-                    'R_val': TCR
-                })
-
-        # 5. System Calculations (Q)
-        results_q = self._calculate_system_q(forces, iface_tcr_accumulation, thot, tcold, materials)
-
-        # 6. Export & Show
-        self._export_and_show_results(model_name, results_tcr, results_q)
+        path_tcr, path_q = self.manager.export_results(model_name, results_tcr, results_q)
+        self.app.log(f"Sim {model_name} completed. Files saved.")
+        self._show_results_window(f"{model_name} - Szczegóły (TCR)", results_tcr, 
+                                  ['force_N', 'interface', 'pressure_Pa', 'pct_styku', 'pct_int', 'h_c', 'R_c', 'h_int', 'R_int', 'h_eff', 'TCR', 'K'])
+        self._show_results_window(f"{model_name} - Podsumowanie (Q)", results_q, 
+                                  ['force_N', 'R_U', 'TCRsum', 'Q'])
 
     def _get_forces(self):
         """Parses forces from app system."""
@@ -427,54 +261,8 @@ class SimulationTab(ttk.Frame):
     def _calculate_system_q(self, forces, tcr_data, thot, tcold, materials):
         """Calculates total system resistance and heat flow for each force case."""
         # 1. Bulk Resistance (R_bulk)
-        geoms = getattr(self.app, 'system_geometries', []) or []
-        R_bulk_total = 0.0
-        
-        for g in geoms:
-            try:
-                mat = materials.get(g.name, {})
-                k = float(mat.get('k', 0))
-                if k > 0:
-                    area = float(g.length) * float(g.width)
-                    R_bulk_total += float(g.height) / (k * area)
-            except: pass
-
-        # 2. Combine with TCR for each force
-        q_rows = []
-        dT = abs(thot - tcold)
-        
-        for f in forces:
-            sum_R_interface = 0.0
-            valid = True
-            
-            # Sum up TCR of all interfaces for this force
-            found_interfaces = 0
-            for iface_name, entries in tcr_data.items():
-                entry = next((e for e in entries if abs(e['force'] - f) < 1e-9), None)
-                if entry:
-                    if entry['R_val'] == float('inf'):
-                        valid = False
-                    else:
-                        sum_R_interface += entry['R_val']
-                    found_interfaces += 1
-            
-            if not valid or found_interfaces == 0:
-                R_total = float('inf')
-                Q = 0.0
-            else:
-                R_total = R_bulk_total + sum_R_interface
-                Q = dT / R_total if R_total > 0 else 0.0
-
-            # Store using keys required for export
-            q_rows.append({
-                'force_N': f,
-                'R_U': R_bulk_total,
-                'TCRsum': sum_R_interface,
-                'R_total': R_total, # Internal use
-                'Q': Q
-            })
-            
-        return q_rows
+        # Deprecated (handled in manager)
+        return self.manager._calculate_system_q(forces, tcr_data, thot, tcold)
 
     def _export_and_show_results(self, model_name, tcr_rows, q_rows):
         """Handles CSV export and window display with specific requested format."""
@@ -541,11 +329,7 @@ class SimulationTab(ttk.Frame):
         self.app.log(f"Sim {model_name} completed. Files saved.")
         
         # Show Result Windows (mapped keys to display)
-        self._show_results_window(f"{model_name} - Szczegóły (TCR)", tcr_rows, 
-                                  ['force_N', 'interface', 'pressure_Pa', 'pct_styku', 'pct_int', 'h_c', 'R_c', 'h_int', 'R_int', 'h_eff', 'TCR', 'K'])
-        
-        self._show_results_window(f"{model_name} - Podsumowanie (Q)", q_rows, 
-                                  ['force_N', 'R_U', 'TCRsum', 'Q'])
+        # handled in run_generic
 
     def _show_results_window(self, title, data, keys):
         win = tk.Toplevel(self)
@@ -580,16 +364,15 @@ class SimulationTab(ttk.Frame):
         """Displays calculated surface parameters."""
         materials = getattr(self.app, 'system_materials', {}) or {}
         interfaces = getattr(self.app, 'system_interfaces', []) or []
-        tcr_ifaces = [i for i in interfaces if getattr(i, 'has_tcr', False)]
-        
-        data = []
-        for iface in tcr_ifaces:
-            p = self._get_interface_params(iface, materials)
-            if p:
-                data.append(p)
-        
+        geoms = getattr(self.app, 'system_geometries', []) or []
+        self.manager.set_context(geoms, interfaces, materials, getattr(self.app, 'system_tims', []) or [], self._get_forces())
+        data = self.manager.microsurface_report()
         if not data:
             messagebox.showinfo("Info", "Brak interfejsów do raportowania.")
             return
-
         self._show_results_window("Raport Mikropowierzchni", data, ['name', 'sig_s', 'm_s', 'k_s', 'e_s', 'hc_soft'])
+
+    # --- Manager events ---
+    def _on_manager_event(self, event_type, data):
+        # currently UI handled directly; hook reserved for future updates
+        pass
