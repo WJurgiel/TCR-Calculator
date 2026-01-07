@@ -132,15 +132,29 @@ class SimulationTab(ttk.Frame):
             def update_visibility(event=None, v_tim=var_tim, l=lbl_th, e=ent_th):
                 sel_name = v_tim.get()
                 sel_tim = next((t for t in tims if t.get('name') == sel_name), None)
+                
                 if sel_tim:
-                    # Logic: if pressure dependent -> hide manual thickness? 
-                    # Assuming standard behavior: always show thickness unless it's strictly calculated internally
-                    # For now keeping logic simple:
-                    if sel_tim.get('type') == 'paste':
-                        l.config(text='BLT [m]:')
-                    else:
+                    is_paste = (sel_tim.get('type') == 'paste')
+                    is_gas = (sel_tim.get('type') == 'gas')
+                    is_press_dep = sel_tim.get('pressure_dependent', False)
+
+                    if is_gas and is_press_dep:
+                        # Gas + Pressure Dependent -> Calculated via Antonetti
                         l.config(text='Szczelina [m]:')
-            
+                        e.delete(0, 'end')
+                        e.insert(0, 'Auto')
+                        e.state(['disabled'])
+                    elif is_paste:
+                        # Paste -> BLT required
+                        l.config(text='BLT [m]:')
+                        e.state(['!disabled'])
+                        if e.get() == 'Auto': e.delete(0, 'end')
+                    else:
+                        # Gas + Not Pressure Dependent -> Fixed gap required
+                        l.config(text='Szczelina [m]:')
+                        e.state(['!disabled'])
+                        if e.get() == 'Auto': e.delete(0, 'end')
+
             cmb.bind('<<ComboboxSelected>>', update_visibility)
             update_visibility() # Init
 
@@ -305,11 +319,12 @@ class SimulationTab(ttk.Frame):
             tim_name = cfg['tim_var'].get()
             selected_tim = next((t for t in tims_list if t['name'] == tim_name), None)
             
-            try:
-                blt = float(cfg['thickness_entry'].get().replace(',', '.'))
-            except ValueError:
-                blt = 0.0 # Default or error
-
+            # --- Logic for Thickness / BLT ---
+            user_blt_str = cfg['thickness_entry'].get().replace(',', '.')
+            
+            is_gas = (selected_tim.get('type') == 'gas') if selected_tim else False
+            is_press_dep = selected_tim.get('pressure_dependent', False) if selected_tim else False
+            
             # 4. Loop through Forces
             for force_val in forces:
                 A_nom = params['A_nom']
@@ -322,21 +337,48 @@ class SimulationTab(ttk.Frame):
 
                 # --- B. Gap Conductance (TIM) ---
                 h_int = 0.0
-                if selected_tim and blt > 0:
+                
+                if selected_tim:
                     k_tim = float(selected_tim.get('k', 0))
-                    h_int = k_tim / blt
+                    
+                    if is_gas and is_press_dep:
+                        # Auto-calculate using Antonetti formula
+                        hc_soft = params['hc_soft']
+                        sig_s = params['sig_s']
+                        
+                        if hc_soft > 0 and sig_s > 0 and Pressure > 0:
+                            try:
+                                delta = 1.53 * sig_s * ((Pressure / hc_soft) ** -0.097)
+                                if delta > 0:
+                                    h_int = k_tim / delta
+                            except Exception:
+                                h_int = 0.0
+                    else:
+                        # Use Fixed thickness (user input)
+                        try:
+                            blt_val = float(user_blt_str)
+                            if blt_val > 0:
+                                h_int = k_tim / blt_val
+                        except ValueError:
+                            h_int = 0.0
+
                 
-                # --- C. Effective Resistance ---
-                # h_eff = h_c + h_int (parallel conductance -> series resistance in concept of layers?)
-                # Actually for contact interface: h_total = h_contact + h_gap (parallel paths)
-                # So R_eff = 1 / ( (h_c + h_int) * Area )
-                
+                # --- C. Effective Resistance & Metrics ---
                 h_eff = h_c + h_int
                 
+                # Metrics for table
+                R_c = 1.0 / (h_c * A_nom) if h_c > 0 else float('inf')
+                R_int = 1.0 / (h_int * A_nom) if h_int > 0 else float('inf')
+                
+                pct_styku = 0.0
+                if params['hc_soft'] > 0:
+                    pct_styku = min(100.0, (Pressure / params['hc_soft']) * 100.0)
+                pct_int = 100.0 - pct_styku
+
                 if h_eff > 0:
                     R_eff = 1.0 / (h_eff * A_nom)
                     TCR = R_eff
-                    K_eff = 0.0001 / (TCR * A_nom) # Just a legacy metric?
+                    K_eff = 0.0001 / (TCR * A_nom)
                 else:
                     R_eff = float('inf')
                     TCR = float('inf')
@@ -347,8 +389,12 @@ class SimulationTab(ttk.Frame):
                     'force_N': force_val,
                     'interface': params['name'],
                     'pressure_Pa': Pressure,
+                    'pct_styku': pct_styku,
+                    'pct_int': pct_int,
                     'h_c': h_c,
+                    'R_c': R_c,
                     'h_int': h_int,
+                    'R_int': R_int,
                     'h_eff': h_eff,
                     'TCR': TCR,
                     'K': K_eff
@@ -397,19 +443,13 @@ class SimulationTab(ttk.Frame):
         q_rows = []
         dT = abs(thot - tcold)
         
-        # Determine minimal area for h_sys calculation (conventional)
-        # Just taking the first interface area or generic approach
-        # For simplicity, we just report R_total and Q
-        
         for f in forces:
             sum_R_interface = 0.0
             valid = True
             
             # Sum up TCR of all interfaces for this force
-            # Note: This assumes SERIES connection of all interfaces
             found_interfaces = 0
             for iface_name, entries in tcr_data.items():
-                # Find entry for this force
                 entry = next((e for e in entries if abs(e['force'] - f) < 1e-9), None)
                 if entry:
                     if entry['R_val'] == float('inf'):
@@ -425,18 +465,19 @@ class SimulationTab(ttk.Frame):
                 R_total = R_bulk_total + sum_R_interface
                 Q = dT / R_total if R_total > 0 else 0.0
 
+            # Store using keys required for export
             q_rows.append({
                 'force_N': f,
-                'R_bulk': R_bulk_total,
-                'R_iface': sum_R_interface,
-                'R_total': R_total,
+                'R_U': R_bulk_total,
+                'TCRsum': sum_R_interface,
+                'R_total': R_total, # Internal use
                 'Q': Q
             })
             
         return q_rows
 
     def _export_and_show_results(self, model_name, tcr_rows, q_rows):
-        """Handles CSV export and window display."""
+        """Handles CSV export and window display with specific requested format."""
         # Filenames
         tag = model_name.lower().replace(' ', '_').replace('-', '_')
 
@@ -446,30 +487,52 @@ class SimulationTab(ttk.Frame):
         path_tcr = os.path.join(output_dir, f"TCR.csv")
         path_q = os.path.join(output_dir, f"Q.csv")
 
-        # Save TCR
+        # --- Save TCR CSV ---
+        # Requested Format: ciśnienie [Pa], %styku, %int, hc [W/m^2K], Rc [K/W], h_int[W/m^2K], R_int [K/W], h_eff [W/m^2K, TCR [K/W], K_warstwy
+        # (Keeping Force/Interface at the start for data integrity)
         try:
             with open(path_tcr, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Force[N]', 'Interface', 'Pressure[Pa]', 'h_contact', 'h_gap', 'h_eff', 'R_th[K/W]', 'K'])
+                headers = [
+                    'Force[N]', 'Interface', 
+                    'ciśnienie [Pa]', '%styku', '%int', 
+                    'hc [W/m^2K]', 'Rc [K/W]', 
+                    'h_int[W/m^2K]', 'R_int [K/W]', 
+                    'h_eff [W/m^2K]', 'TCR [K/W]', 'K_warstwy'
+                ]
+                writer.writerow(headers)
+                
                 for r in tcr_rows:
                     writer.writerow([
-                        r['force_N'], r['interface'], f"{r['pressure_Pa']:.4f}",
-                        f"{r['h_c']:.4f}", f"{r['h_int']:.4f}", f"{r['h_eff']:.4f}",
+                        r['force_N'], 
+                        r['interface'], 
+                        f"{r['pressure_Pa']:.4f}",
+                        f"{r['pct_styku']:.2f}",
+                        f"{r['pct_int']:.2f}",
+                        f"{r['h_c']:.4f}",
+                        (f"{r['R_c']:.4f}" if r['R_c'] != float('inf') else 'INF'),
+                        f"{r['h_int']:.4f}",
+                        (f"{r['R_int']:.4f}" if r['R_int'] != float('inf') else 'INF'),
+                        f"{r['h_eff']:.4f}",
                         (f"{r['TCR']:.4f}" if r['TCR'] != float('inf') else 'INF'),
                         f"{r['K']:.4f}"
                     ])
         except Exception as e:
             self.app.log(f"Error saving TCR: {e}")
 
-        # Save Q
+        # --- Save Q CSV ---
+        # Requested Format: R_U (całkowity opor przenikania)[K/W], TCRsum (całkowity opór tcr w systemie,suma wszystkich TCR) [K/W], Q [W]
         try:
             with open(path_q, 'w', newline='', encoding='utf-8') as f:
                 writer = csv.writer(f)
-                writer.writerow(['Force[N]', 'R_Bulk', 'R_Interfaces', 'R_Total', 'Q[W]'])
+                headers = ['Force[N]', 'R_U [K/W]', 'TCRsum [K/W]', 'Q [W]']
+                writer.writerow(headers)
+                
                 for r in q_rows:
                     writer.writerow([
-                        r['force_N'], f"{r['R_bulk']:.4f}", f"{r['R_iface']:.4f}",
-                        (f"{r['R_total']:.4f}" if r['R_total'] != float('inf') else 'INF'),
+                        r['force_N'], 
+                        f"{r['R_U']:.4f}", 
+                        f"{r['TCRsum']:.4f}",
                         f"{r['Q']:.4f}"
                     ])
         except Exception as e:
@@ -477,27 +540,30 @@ class SimulationTab(ttk.Frame):
 
         self.app.log(f"Sim {model_name} completed. Files saved.")
         
-        # Show Result Windows
+        # Show Result Windows (mapped keys to display)
         self._show_results_window(f"{model_name} - Szczegóły (TCR)", tcr_rows, 
-                                  ['force_N', 'interface', 'pressure_Pa', 'h_c', 'h_int', 'h_eff', 'TCR', 'K'])
+                                  ['force_N', 'interface', 'pressure_Pa', 'pct_styku', 'pct_int', 'h_c', 'R_c', 'h_int', 'R_int', 'h_eff', 'TCR', 'K'])
+        
         self._show_results_window(f"{model_name} - Podsumowanie (Q)", q_rows, 
-                                  ['force_N', 'R_bulk', 'R_iface', 'R_total', 'Q'])
+                                  ['force_N', 'R_U', 'TCRsum', 'Q'])
 
     def _show_results_window(self, title, data, keys):
         win = tk.Toplevel(self)
         win.title(title)
-        win.geometry("800x400")
+        win.geometry("1100x400") # Wider for more columns
         
         tree = ttk.Treeview(win, columns=keys, show='headings')
         for k in keys:
             tree.heading(k, text=k)
-            tree.column(k, width=90)
+            tree.column(k, width=80)
         
         vsb = ttk.Scrollbar(win, orient="vertical", command=tree.yview)
-        tree.configure(yscrollcommand=vsb.set)
+        hsb = ttk.Scrollbar(win, orient="horizontal", command=tree.xview)
+        tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         
         tree.pack(side='left', fill='both', expand=True)
         vsb.pack(side='right', fill='y')
+        hsb.pack(side='bottom', fill='x')
 
         for item in data:
             vals = []

@@ -251,20 +251,40 @@ class MaterialsTab(ttk.Frame):
             frm_type = ttk.Frame(inner)
             frm_type.grid(row=r, column=2, padx=4, pady=2, sticky='we')
             var_type = tk.StringVar(value=tim_data.get('type', 'gas'))
-            rb_gas = ttk.Radiobutton(frm_type, text='Gas', variable=var_type, value='gas')
-            rb_gas.pack(side='left', padx=2)
-            rb_paste = ttk.Radiobutton(frm_type, text='Paste', variable=var_type, value='paste')
-            rb_paste.pack(side='left', padx=2)
             
             # Column 3: Pressure-dependent (Radio buttons: Yes/No)
             frm_pressure = ttk.Frame(inner)
             frm_pressure.grid(row=r, column=3, padx=4, pady=2, sticky='we')
             var_pressure = tk.BooleanVar(value=tim_data.get('pressure_dependent', False))
+            
             rb_yes = ttk.Radiobutton(frm_pressure, text='Yes', variable=var_pressure, value=True)
             rb_yes.pack(side='left', padx=2)
             rb_no = ttk.Radiobutton(frm_pressure, text='No', variable=var_pressure, value=False)
             rb_no.pack(side='left', padx=2)
-            
+
+            # --- Logic to handle interaction between Type and Pressure Dependency ---
+            def update_pressure_state(_=None, v_type=var_type, v_press=var_pressure, r_y=rb_yes, r_n=rb_no):
+                if v_type.get() == 'paste':
+                    # Paste cannot be pressure dependent -> force No and disable
+                    v_press.set(False)
+                    r_y.configure(state='disabled')
+                    r_n.configure(state='disabled')
+                else:
+                    # Gas -> enable choice
+                    r_y.configure(state='normal')
+                    r_n.configure(state='normal')
+
+            # Bind the update to radio buttons
+            rb_gas = ttk.Radiobutton(frm_type, text='Gas', variable=var_type, value='gas', 
+                                     command=update_pressure_state)
+            rb_gas.pack(side='left', padx=2)
+            rb_paste = ttk.Radiobutton(frm_type, text='Paste', variable=var_type, value='paste',
+                                       command=update_pressure_state)
+            rb_paste.pack(side='left', padx=2)
+
+            # Initialize state
+            update_pressure_state()
+
             # Column 4: Actions (no per-row remove when using global clear)
             frm_actions = ttk.Frame(inner)
             frm_actions.grid(row=r, column=4, padx=4, pady=2, sticky='we')
@@ -461,6 +481,9 @@ class MaterialsTab(ttk.Frame):
             # Read pressure_dependent
             try:
                 tim_pressure = widgets['pressure_dependent'].get()
+                # Secondary validation: if paste, force false
+                if tim_data['type'] == 'paste':
+                    tim_pressure = False
                 tim_data['pressure_dependent'] = tim_pressure
             except Exception:
                 tim_data['pressure_dependent'] = False
@@ -593,8 +616,3 @@ class MaterialsTab(ttk.Frame):
             self.load_system()  # Rebuild table
         else:
             self.app.log('! Nie udało się importować TIM-ów z pliku (brak prawidłowych wpisów)')
-
-
-
-
-
