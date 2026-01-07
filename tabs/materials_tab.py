@@ -12,6 +12,7 @@ Behavior:
 import tkinter as tk
 from tkinter import ttk, filedialog, messagebox
 import os
+from controllers import MaterialsManager
 
 
 class MaterialsTab(ttk.Frame):
@@ -19,14 +20,13 @@ class MaterialsTab(ttk.Frame):
         super().__init__(parent)
         self.app = app
 
-        # Internal storage: name -> dict of material properties
-        self.materials = {}
+        # Manager for business logic
+        self.manager = MaterialsManager(app=self.app)
+        self.manager.subscribe(self._on_manager_event)
+
+        # View state
         self.row_widgets = {}  # geom_idx -> dict of widgets for the row
-        
-        # TIM storage: list of TIM definitions (each TIM: {name, k, type, pressure_dependent})
-        self.tims = []
         self.tim_widgets = {}  # tim_idx -> dict of TIM widgets
-        self._tim_next_id = 1
 
         # Header / controls
         frm_top = ttk.Frame(self)
@@ -67,22 +67,35 @@ class MaterialsTab(ttk.Frame):
             self._show_no_system()
             self.app.log('! Brak systemu do załadowania. Zdefiniuj system w zakładce System i naciśnij Save System.')
             return
-
-        # Build table UI with index-based TCR participation determination
+        interfaces = getattr(self.app, 'system_interfaces', []) or []
+        self.manager.set_system(geoms, interfaces)
+        # Build table UI
         self._build_table(geoms)
 
     def _build_table(self, geoms):
         # First, save current TIM values from widgets before clearing
+        current_tims = []
         for tim_idx, widgets in self.tim_widgets.items():
-            if tim_idx < len(self.tims):
-                try:
-                    self.tims[tim_idx]['name'] = widgets['name'].get()
-                    k_val = widgets['k'].get()
-                    self.tims[tim_idx]['k'] = float(k_val) if k_val != '' else ''
-                    self.tims[tim_idx]['type'] = widgets['type'].get()
-                    self.tims[tim_idx]['pressure_dependent'] = widgets['pressure_dependent'].get()
-                except Exception:
-                    pass
+            try:
+                ent_name = widgets['name'].get()
+                k_val = widgets['k'].get()
+                type_val = widgets['type'].get()
+                press_val = widgets['pressure_dependent'].get()
+                tid = widgets.get('id')
+                if ent_name.strip() == '' and k_val == '':
+                    continue
+                tim_obj = {
+                    'id': tid,
+                    'name': ent_name,
+                    'k': float(k_val) if k_val != '' else '',
+                    'type': type_val,
+                    'pressure_dependent': press_val
+                }
+                current_tims.append(tim_obj)
+            except Exception:
+                pass
+        if current_tims:
+            self.manager.set_tims(current_tims)
         
         self._clear_container()
 
@@ -126,25 +139,17 @@ class MaterialsTab(ttk.Frame):
                     pass
 
             # Initialize materials dict for this geometry name (preserve existing values)
-            if g.name not in self.materials:
-                self.materials[g.name] = {
-                    'material_name': '',
-                    'k': '',
-                    'young': '',
-                    'poisson': '',
-                    'sigma': '',
-                    'm': '',
-                    'hc': ''
-                }
+            self.manager.ensure_material_entry(g.name)
 
             lbl = ttk.Label(inner, text=name)
             lbl.grid(row=r, column=0, padx=4, pady=2, sticky='w')
 
+            materials = self.manager.get_materials()
             def make_entry(val_key, col, state='normal'):
                 ent = ttk.Entry(inner)
                 ent.grid(row=r, column=col, padx=4, pady=2, sticky='we')
                 ent.delete(0, 'end')
-                ent.insert(0, str(self.materials.get(name, {}).get(val_key, '')))
+                ent.insert(0, str(materials.get(name, {}).get(val_key, '')))
                 if state == 'disabled':
                     ent.state(['disabled'])
                 else:
@@ -229,11 +234,14 @@ class MaterialsTab(ttk.Frame):
         r += 1
         
         # Build TIM definition rows
-        for tim_idx, tim_data in enumerate(self.tims):
+        for tim_idx, tim_data in enumerate(self.manager.get_tims()):
             # Ensure each TIM has a stable unique id
             if 'id' not in tim_data:
-                tid = self._tim_next_id
-                self._tim_next_id += 1
+                # Ask manager to maintain id sequence on set_tims/save
+                tid = tim_data.get('id') or None
+                if tid is None:
+                    # generate a temporary id for UI; real id will be set on save
+                    tid = - (tim_idx + 1)
                 tim_data['id'] = tid
             # Column 0: TIM Name
             ent_tim_name = ttk.Entry(inner)
@@ -313,79 +321,22 @@ class MaterialsTab(ttk.Frame):
         if not file_path:
             return
 
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith('#')]
-        except Exception as e:
-            messagebox.showerror('Error', f'Failed to open file: {e}')
-            return
-
         geoms = getattr(self.app, 'system_geometries', None)
+        interfaces = getattr(self.app, 'system_interfaces', []) or []
         if not geoms:
             self.app.log('! Import przerwany: brak załadowanego systemu (zapisz system w zakładce System).')
             return
-
-        geom_names = {g.name for g in geoms}
-        interfaces = getattr(self.app, 'system_interfaces', []) or []
-        iface_names = set()
-        for it in interfaces:
-            try:
-                if getattr(it, 'has_tcr', False):
-                    iface_names.add(it.geom_top.name)
-                    iface_names.add(it.geom_bottom.name)
-            except Exception:
-                pass
-
-        imported = 0
-        for i, line in enumerate(lines, start=1):
-            parts = line.split()
-            if not parts:
-                continue
-            name = parts[0]
-            if name not in geom_names:
-                self.app.log(f'! Import: nieznana bryła "{name}" w linii {i} — pomijam')
-                continue
-
-            # Determine allowed fields
-            # Only geometries participating in interfaces with TCR allow all fields
-            allowed_all = name in iface_names
-
-            # Fill values if present
-            # parts indices: 0:name,1:material_name,2:k,3:young,4:poisson,5:sigma,6:m,7:hc
-            row_errors = []
-            # material_name
-            if len(parts) >= 2:
-                self.materials[name]['material_name'] = parts[1]
-            # k (mandatory numeric)
-            if len(parts) >= 3:
-                try:
-                    self.materials[name]['k'] = float(parts[2])
-                except ValueError:
-                    row_errors.append('k (invalid number)')
-            else:
-                row_errors.append('k (missing)')
-
-            # remaining numeric fields
-            field_names = ['young', 'poisson', 'sigma', 'm', 'hc']
-            for idx, fname in enumerate(field_names, start=3):
-                if len(parts) > idx:
-                    if not allowed_all:
-                        row_errors.append(f'{fname} (not allowed for non-interface body)')
-                        continue
-                    try:
-                        self.materials[name][fname] = float(parts[idx])
-                    except ValueError:
-                        row_errors.append(f'{fname} (invalid number)')
-
-            if row_errors:
-                self.app.log(f'! Import: nieprawidłowe wartości dla bryły {name} (linia {i}): {", ".join(row_errors)} — pomijam błędne pola')
-            else:
-                imported += 1
+        # Ensure manager knows current system
+        self.manager.set_system(geoms, interfaces)
+        success, msg, imported = self.manager.import_materials_from_file(file_path)
+        if not success:
+            messagebox.showerror('Error', msg)
+            return
 
         # If table exists, refresh displayed values for all rows matching imported names
         if self.row_widgets:
             for name, row_indices in getattr(self, 'rows_by_name', {}).items():
-                vals = self.materials.get(name, {})
+                vals = self.manager.get_materials().get(name, {})
                 for r in row_indices:
                     widgets = self.row_widgets.get(r, {})
                     for key, ent in widgets.items():
@@ -405,161 +356,92 @@ class MaterialsTab(ttk.Frame):
 
     def save_materials(self):
         """Collect values from table and save into app.system_materials and app.system_tims."""
-        # Read from widgets into self.materials — iterate rows (there may be multiple rows with same name)
+        # Read from widgets into local materials
+        materials = self.manager.get_materials().copy()
         for r, widgets in self.row_widgets.items():
             name = widgets.get('name')
             if not name:
                 continue
-            if name not in self.materials:
-                self.materials[name] = {}
+            if name not in materials:
+                materials[name] = {}
             for key, ent in widgets.items():
                 if key == 'name':
                     continue
                 try:
-                    if 'disabled' in ent.state():
-                        val = ent.get()
-                    else:
-                        val = ent.get()
+                    val = ent.get()
                 except Exception:
                     val = ent.get()
                 if key == 'material_name':
-                    # keep last provided string
-                    self.materials[name][key] = val
+                    materials[name][key] = val
                 else:
                     if val == '':
-                        # keep as empty
-                        self.materials[name][key] = ''
+                        materials[name][key] = ''
                     else:
                         try:
-                            self.materials[name][key] = float(val)
+                            materials[name][key] = float(val)
                         except ValueError:
-                            self.materials[name][key] = val
+                            materials[name][key] = val
                             self.app.log(f'! Zapis materiałów: pole {key} dla bryły {name} ma nieprawidłową wartość: "{val}"')
 
-        # Read from TIM widgets into self.tims (now a list)
-        self.tims = []
+        # Read from TIM widgets into tims list
+        tims = []
         for tim_idx in sorted(self.tim_widgets.keys()):
             widgets = self.tim_widgets[tim_idx]
             tim_data = {}
-            
-            # Preserve or assign id
             wid_id = widgets.get('id')
-            if not wid_id:
-                wid_id = self._tim_next_id
-                self._tim_next_id += 1
-            tim_data['id'] = wid_id
-
-            # Read TIM name
+            tim_data['id'] = wid_id if wid_id else None
             try:
                 tim_name = widgets['name'].get().strip()
                 if not tim_name:
-                    continue  # Skip empty TIM entries
+                    continue
                 tim_data['name'] = tim_name
             except Exception:
                 continue
-            
-            # Read k [W/mK]
             try:
                 tim_k = widgets['k'].get()
-                if tim_k == '':
-                    tim_data['k'] = ''
-                else:
-                    tim_data['k'] = float(tim_k)
+                tim_data['k'] = float(tim_k) if tim_k != '' else ''
             except ValueError:
                 self.app.log(f'! Zapis TIM: pole k ma nieprawidłową wartość: "{tim_k}"')
                 continue
-            except Exception:
-                continue
-            
-            # Read type (gas/paste)
             try:
                 tim_type = widgets['type'].get()
                 tim_data['type'] = tim_type
             except Exception:
                 tim_data['type'] = 'gas'
-            
-            # Read pressure_dependent
             try:
                 tim_pressure = widgets['pressure_dependent'].get()
-                # Secondary validation: if paste, force false
                 if tim_data['type'] == 'paste':
                     tim_pressure = False
                 tim_data['pressure_dependent'] = tim_pressure
             except Exception:
                 tim_data['pressure_dependent'] = False
-            
-            self.tims.append(tim_data)
+            tims.append(tim_data)
 
-        # VALIDATION
-        # Check if there are interfaces with TCR
-        interfaces = getattr(self.app, 'system_interfaces', []) or []
-        interfaces_with_tcr = [it for it in interfaces if getattr(it, 'has_tcr', False)]
-
-        # If there are TCR interfaces but no TIMs defined -> abort
-        if interfaces_with_tcr and not self.tims:
-            msg = 'Brak zdefiniowanych TIM-ów, mimo że system zawiera interfejsy z TCR. Zdefiniuj przynajmniej jeden TIM.'
+        # Update manager and validate
+        self.manager.set_materials(materials)
+        self.manager.set_tims(tims)
+        ok, msg, errors = self.manager.validate_before_save()
+        if not ok:
             messagebox.showerror('Błąd zapisu', msg)
-            self.app.log('! Zapis przerwany: brak TIM-ów, a istnieją interfejsy z TCR')
-            return
-
-        # For geometries participating in any TCR interface require full material params
-        geom_names_required = set()
-        for it in interfaces_with_tcr:
-            try:
-                geom_names_required.add(it.geom_top.name)
-                geom_names_required.add(it.geom_bottom.name)
-            except Exception:
-                pass
-
-        missing_errors = []
-        required_fields = ['material_name', 'k', 'young', 'poisson', 'sigma', 'm', 'hc']
-        for gname in sorted(geom_names_required):
-            vals = self.materials.get(gname, {})
-            for fld in required_fields:
-                if fld not in vals or vals.get(fld, '') == '':
-                    missing_errors.append(f'Bryła "{gname}": brak pola {fld}')
-                else:
-                    # numeric checks for numeric fields
-                    if fld != 'material_name':
-                        try:
-                            float(vals.get(fld))
-                        except Exception:
-                            missing_errors.append(f'Bryła "{gname}": pole {fld} ma nieprawidłową wartość')
-
-        if missing_errors:
-            # Show summary popup and log details
-            messagebox.showerror('Błąd zapisu', 'Nie wszystkie wymagane parametry materiałowe są zdefiniowane dla brył w interfejsach TCR. Sprawdź konsolę.')
-            for e in missing_errors:
+            for e in errors:
                 self.app.log('! ' + e)
             return
-
         # Save to app
-        self.app.system_materials = self.materials.copy()
-        self.app.system_tims = self.tims.copy()
+        self.app.system_materials = self.manager.get_materials().copy()
+        self.app.system_tims = self.manager.get_tims().copy()
         self.app.log('✓ Zapisano materiały i TIM-y do systemu')
 
     def _add_tim_row(self):
         """Add a new empty TIM row to the library."""
-        tid = self._tim_next_id
-        self._tim_next_id += 1
-        self.tims.append({
-            'id': tid,
-            'name': '',
-            'k': '',
-            'type': 'gas',
-            'pressure_dependent': False
-        })
-        self.app.log('✓ Dodano nowy TIM do biblioteki')
+        success, msg = self.manager.add_tim()
+        if success:
+            self.app.log('✓ ' + msg)
         self.load_system()  # Rebuild table to show new row
 
     def _clear_all_tims(self):
         """Clear the entire TIM library."""
-        if not self.tims:
-            self.app.log('! Lista TIM-ów jest pusta')
-            return
-        count = len(self.tims)
-        self.tims.clear()
-        self.app.log(f'✓ Wyczyściłem listę TIM-ów ({count} pozycji)')
+        success, msg = self.manager.clear_all_tims()
+        self.app.log(('✓ ' if success else '! ') + msg)
         self.load_system()
 
     def _import_tim_file(self):
@@ -574,45 +456,13 @@ class MaterialsTab(ttk.Frame):
         file_path = filedialog.askopenfilename(filetypes=[('Text files', '*.txt'), ('All', '*.*')])
         if not file_path:
             return
+        success, msg = self.manager.import_tim_file(file_path)
+        self.app.log(('✓ ' if success else '! ') + msg)
+        if success:
+            self.load_system()
 
-        try:
-            with open(file_path, 'r', encoding='utf-8') as f:
-                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith('#')]
-        except Exception as e:
-            self.app.log(f'! Błąd przy czytaniu pliku TIM: {e}')
-            return
-
-        imported_count = 0
-        for line in lines:
-            parts = line.split()
-            if len(parts) < 2:
-                self.app.log(f'! Import TIM: linia "{line}" ma nieprawidłowy format (oczekiwano: nazwa k)')
-                continue
-            
-            tim_name = parts[0]
-            tim_k_str = parts[1]
-            
-            # Try to parse k as float
-            try:
-                tim_k = float(tim_k_str)
-            except ValueError:
-                self.app.log(f'! Import TIM: wartość k dla "{tim_name}" jest nieprawidłowa: "{tim_k_str}"')
-                continue
-            
-            # Add to tims list with unique id
-            tid = self._tim_next_id
-            self._tim_next_id += 1
-            self.tims.append({
-                'id': tid,
-                'name': tim_name,
-                'k': tim_k,
-                'type': 'gas',  # default
-                'pressure_dependent': False  # default
-            })
-            imported_count += 1
-        
-        if imported_count > 0:
-            self.app.log(f'✓ Importowano {imported_count} TIM-ów z pliku')
-            self.load_system()  # Rebuild table
-        else:
-            self.app.log('! Nie udało się importować TIM-ów z pliku (brak prawidłowych wpisów)')
+    # --- Manager events ---
+    def _on_manager_event(self, event_type, data):
+        if event_type in ('materials_updated', 'tims_updated', 'tim_added', 'tims_cleared', 'tims_imported', 'materials_imported', 'materials_system_set'):
+            # For simplicity, leave redraw to caller actions (load_system/save/import) to avoid flicker
+            pass
